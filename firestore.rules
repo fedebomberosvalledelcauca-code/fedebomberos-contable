@@ -1,0 +1,224 @@
+rules_version = '2';
+
+// =====================================================================
+// FEDEBOMBEROS – Reglas de seguridad de Cloud Firestore (Etapa 1)
+// ---------------------------------------------------------------------
+// Principios:
+//  1. Nadie entra sin perfil activo en /usuarios (excepto el administrador
+//     raíz, fijado por UID).
+//  2. Toda escritura sobre datos contables exige un registro de bitácora
+//     creado EN LA MISMA operación atómica (campo auditId). Si la
+//     bitácora no se escribe, la operación completa se rechaza.
+//  3. La bitácora es de solo inserción: nadie la modifica ni la borra.
+//  4. Los comprobantes no se borran: se anulan o se reversan.
+//  5. Los consecutivos solo avanzan de 1 en 1 y solo si en la misma
+//     operación se crea el comprobante con ese número.
+//  6. Solo se registra en periodos existentes y abiertos.
+// =====================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Identidad y roles ----------
+    function raizUid() { return 'hyW8eSx0JtM8POROWIPr4B0p5Ix2'; }
+    function autenticado() { return request.auth != null; }
+    function esRaiz() { return autenticado() && request.auth.uid == raizUid(); }
+    function rutaPerfil() { return /databases/$(database)/documents/usuarios/$(request.auth.uid); }
+    function rol() {
+      return esRaiz() ? 'admin'
+        : (autenticado() && exists(rutaPerfil()) && get(rutaPerfil()).data.activo == true
+            ? get(rutaPerfil()).data.rol : 'ninguno');
+    }
+    function puede(roles) { return rol() in roles; }
+    function activo() { return puede(['admin', 'contador', 'revisor', 'auxiliar']); }
+    function gestor() { return puede(['admin', 'contador']); }
+    function registrador() { return puede(['admin', 'contador', 'auxiliar']); }
+
+    // ---------- Bitácora obligatoria ----------
+    // El documento escrito debe traer auditId = id de un registro de bitácora
+    // creado en esta misma operación (fecha == request.time) que nombre
+    // esta colección y este documento.
+    function auditado(coleccion, docId) {
+      let a = request.resource.data.auditId;
+      let b = getAfter(/databases/$(database)/documents/bitacora/$(a)).data;
+      return a is string
+        && b.fecha == request.time
+        && b.uid == request.auth.uid
+        && b.coleccion == coleccion
+        && docId in b.docIds;
+    }
+
+    // ---------- Periodos ----------
+    function periodoAbierto(p) {
+      let ruta = /databases/$(database)/documents/periodos/$(p);
+      return exists(ruta) && get(ruta).data.estado == 'abierto';
+    }
+
+    // ---------- Validaciones ----------
+    function fechaValida(f) {
+      return f is string && f.matches('^20[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$');
+    }
+
+    function compValido(d) {
+      return d.tipo in ['CI', 'CE', 'CD', 'AJ', 'AP', 'CC', 'DP', 'NO', 'PR', 'RC', 'LT']
+        && d.numero is int && d.numero > 0
+        && fechaValida(d.fecha)
+        && d.periodo is string && d.fecha.matches('^' + d.periodo + '-[0-9]{2}$')
+        && d.concepto is string && d.concepto.size() > 0 && d.concepto.size() <= 500
+        && d.lineas is list && d.lineas.size() >= 2 && d.lineas.size() <= 1000
+        && d.totalDebito is number && d.totalCredito is number
+        && d.totalDebito == d.totalCredito && d.totalDebito > 0
+        && d.estado in ['contabilizado', 'anulado'];
+    }
+
+    function cuentaValida(d, codigo) {
+      return d.codigo == codigo
+        && codigo.matches('^[1-9][0-9]{0,15}$')
+        && d.nombre is string && d.nombre.size() > 0 && d.nombre.size() <= 200
+        && d.naturaleza in ['D', 'C']
+        && d.movimiento is bool && d.activa is bool
+        && d.exigeTercero is bool && d.exigeCentro is bool;
+    }
+
+    function terceroValido(d, id) {
+      return d.tipoId is string && d.numero is string
+        && d.numero.matches('^[0-9A-Za-z]{3,20}$')
+        && id == d.tipoId + '-' + d.numero
+        && d.nombre is string && d.nombre.size() > 0 && d.nombre.size() <= 250
+        && d.activo is bool;
+    }
+
+    // =================================================================
+    // COLECCIONES
+    // =================================================================
+
+    // Bitácora: solo inserción, firmada por el propio usuario y con hora del servidor.
+    match /bitacora/{id} {
+      allow read: if puede(['admin', 'contador', 'revisor']);
+      allow create: if registrador()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.fecha == request.time
+        && request.resource.data.coleccion is string
+        && request.resource.data.accion is string
+        && request.resource.data.docIds is list
+        && request.resource.data.docIds.size() > 0
+        && request.resource.data.docIds.size() <= 300;
+      allow update, delete: if false;
+    }
+
+    // Usuarios y roles: solo el administrador asigna roles.
+    match /usuarios/{uid} {
+      allow read: if autenticado() && (request.auth.uid == uid || activo());
+      allow create, update: if puede(['admin'])
+        && request.resource.data.rol in ['admin', 'contador', 'revisor', 'auxiliar']
+        && request.resource.data.activo is bool
+        && request.resource.data.email is string
+        && auditado('usuarios', uid);
+      allow delete: if false;
+    }
+
+    // Configuración institucional y estado de la apertura.
+    match /config/{doc} {
+      allow read: if activo();
+      allow create, update: if gestor() && auditado('config', doc);
+      allow delete: if false;
+    }
+
+    // Periodos contables: los abre y cierra el administrador.
+    match /periodos/{p} {
+      allow read: if activo();
+      allow create, update: if puede(['admin'])
+        && p.matches('^20[0-9]{2}-(0[1-9]|1[0-2])$')
+        && request.resource.data.estado in ['abierto', 'cerrado']
+        && auditado('periodos', p);
+      allow delete: if false;
+    }
+
+    // Plan de cuentas.
+    match /puc/{codigo} {
+      allow read: if activo();
+      allow create: if gestor() && cuentaValida(request.resource.data, codigo)
+        && auditado('puc', codigo);
+      allow update: if gestor() && cuentaValida(request.resource.data, codigo)
+        && auditado('puc', codigo);
+      allow delete: if false;
+    }
+
+    // Terceros (id = tipoId-numero: impide duplicados por construcción).
+    match /terceros/{tid} {
+      allow read: if activo();
+      allow create: if registrador() && terceroValido(request.resource.data, tid)
+        && auditado('terceros', tid);
+      allow update: if (gestor()
+          || (puede(['auxiliar'])
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['soportes', 'auditId'])))
+        && terceroValido(request.resource.data, tid)
+        && auditado('terceros', tid);
+      allow delete: if false;
+    }
+
+    // Consecutivos por tipo de comprobante: avanzan de 1 en 1 y solo
+    // junto con la creación del comprobante correspondiente.
+    match /consecutivos/{tipo} {
+      allow read: if activo();
+      allow create: if registrador()
+        && request.resource.data.ultimo == 1
+        && existsAfter(/databases/$(database)/documents/comprobantes/$(tipo + '-1'));
+      allow update: if registrador()
+        && request.resource.data.ultimo == resource.data.ultimo + 1
+        && existsAfter(/databases/$(database)/documents/comprobantes/$(tipo + '-' + string(request.resource.data.ultimo)));
+      allow delete: if false;
+    }
+
+    // Comprobantes contables.
+    match /comprobantes/{cid} {
+      allow read: if activo();
+
+      allow create: if registrador()
+        && compValido(request.resource.data)
+        && request.resource.data.estado == 'contabilizado'
+        && cid == request.resource.data.tipo + '-' + string(request.resource.data.numero)
+        && getAfter(/databases/$(database)/documents/consecutivos/$(request.resource.data.tipo)).data.ultimo == request.resource.data.numero
+        && periodoAbierto(request.resource.data.periodo)
+        && request.resource.data.creadoPor == request.auth.uid
+        && request.resource.data.creadoEn == request.time
+        && (request.resource.data.tipo != 'AP' || gestor())
+        && auditado('comprobantes', cid);
+
+      // Edición, anulación o adjuntar soportes. Identidad del comprobante inmutable;
+      // un comprobante anulado ya no cambia; el de apertura solo se anula.
+      allow update: if compValido(request.resource.data)
+        && resource.data.estado == 'contabilizado'
+        && request.resource.data.tipo == resource.data.tipo
+        && request.resource.data.numero == resource.data.numero
+        && request.resource.data.creadoPor == resource.data.creadoPor
+        && request.resource.data.creadoEn == resource.data.creadoEn
+        && periodoAbierto(resource.data.periodo)
+        && periodoAbierto(request.resource.data.periodo)
+        && auditado('comprobantes', cid)
+        && (
+          (gestor() && resource.data.tipo != 'AP')
+          || (gestor() && resource.data.tipo == 'AP'
+              && request.resource.data.estado == 'anulado'
+              && request.resource.data.diff(resource.data).affectedKeys()
+                   .hasOnly(['estado', 'anuladoPor', 'anuladoEn', 'motivoAnulacion', 'auditId']))
+          || (puede(['auxiliar'])
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['soportes', 'auditId']))
+        );
+      allow delete: if false;
+    }
+
+    // Borrador de saldos iniciales (área de trabajo antes de confirmar la apertura).
+    match /aperturaBorrador/{linea} {
+      allow read: if activo();
+      allow create, update, delete: if gestor()
+        && !(exists(/databases/$(database)/documents/config/apertura)
+             && get(/databases/$(database)/documents/config/apertura).data.estado == 'confirmada');
+    }
+
+    // Cualquier otra ruta: denegada.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
